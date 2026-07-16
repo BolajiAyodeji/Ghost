@@ -33,6 +33,15 @@ const messages = {
  * @prop {{getActiveByMembers: (memberIds: string[]) => Promise<Map<string, {cadence: 'month' | 'year', currency: string, amount: number}>>}} service
  */
 
+/**
+ * @typedef {object} ICustomFieldsServiceWrapper
+ * @prop {{
+ *   getValuesForMembers: (memberIds: string[]) => Promise<Map<string, Record<string, unknown>>>,
+ *   planWrite: (values: unknown) => Promise<object[]>,
+ *   applyWrite: (memberId: string, writes: object[]) => Promise<void>
+ * }} valuesService
+ */
+
 module.exports = class MemberBREADService {
     /**
      * @param {object} deps
@@ -46,8 +55,9 @@ module.exports = class MemberBREADService {
      * @param {import('../../../settings-helpers/settings-helpers')} deps.settingsHelpers
      * @param {import('./next-payment-calculator')} deps.nextPaymentCalculator
      * @param {IGiftServiceWrapper} deps.giftService
+     * @param {ICustomFieldsServiceWrapper} deps.customFieldsService
      */
-    constructor({memberRepository, labsService, emailService, stripeService, offersAPI, memberAttributionService, emailSuppressionList, settingsHelpers, nextPaymentCalculator, commentsService, giftService}) {
+    constructor({memberRepository, labsService, emailService, stripeService, offersAPI, memberAttributionService, emailSuppressionList, settingsHelpers, nextPaymentCalculator, commentsService, giftService, customFieldsService}) {
         this.offersAPI = offersAPI;
         /** @private */
         this.memberRepository = memberRepository;
@@ -69,6 +79,37 @@ module.exports = class MemberBREADService {
         this.commentsService = commentsService;
         /** @private */
         this.giftService = giftService;
+        /** @private */
+        this.customFieldsService = customFieldsService;
+    }
+
+    /**
+     * @private
+     * Custom field values keyed by member id, or `null` when the feature is off —
+     * the flag lives here, so callers just check the result: `null` means omit the
+     * `custom_fields` key entirely, keeping a pre-feature member payload identical.
+     *
+     * A read gets values on the flag alone, with no opt-in include: a member's
+     * custom fields are their own data, like labels and tiers, which a read
+     * already returns unasked. `include` is for things that are expensive or
+     * aggregate (email_recipients, counts), and one flat lookup on a read that
+     * already issues a dozen queries is neither. The flag, not an include, is what
+     * protects consumers that predate the feature — an include would outlive it
+     * and become permanent API surface.
+     *
+     * Browse is the opposite — opt-in via `include=custom_fields`, exactly how
+     * `products`/`tiers` already behave: a read always carries them, a list only
+     * when asked. Read and browse must stay format-identical, so a browse that
+     * asks gets the same key a read gives unasked.
+     * @param {string[]} memberIds
+     * @returns {Promise<Map<string, Record<string, unknown>> | null>}
+     */
+    async fetchCustomFieldValues(memberIds) {
+        if (!this.labsService.isSet('membersCustomFields')) {
+            return null;
+        }
+
+        return this.customFieldsService.valuesService.getValuesForMembers(memberIds);
     }
 
     /**
@@ -392,6 +433,11 @@ module.exports = class MemberBREADService {
         const unsubscribeUrl = this.settingsHelpers.createUnsubscribeUrl(member.uuid);
         member.unsubscribe_url = unsubscribeUrl;
 
+        const customFields = await this.fetchCustomFieldValues([member.id]);
+        if (customFields) {
+            member.custom_fields = customFields.get(member.id) ?? {};
+        }
+
         return member;
     }
 
@@ -478,6 +524,22 @@ module.exports = class MemberBREADService {
     async edit(data, options) {
         delete data.last_seen_at;
 
+        // Values live in their own table, so they come off the member data before
+        // the repository sees it — `custom_fields` is not a member column. It only
+        // reaches here at all when the flag is on (the input validator strips it
+        // otherwise), so its presence is the signal to write.
+        const customFields = data.custom_fields;
+        const writeCustomFields = customFields !== undefined;
+        delete data.custom_fields;
+
+        // Plan (which validates) before the member is touched, so a bad value 422s
+        // here rather than after the member edit has been applied — and keep the
+        // plan to apply once below, so the values aren't resolved and validated
+        // twice.
+        const plannedCustomFields = writeCustomFields
+            ? await this.customFieldsService.valuesService.planWrite(customFields)
+            : null;
+
         let model;
 
         try {
@@ -521,6 +583,10 @@ module.exports = class MemberBREADService {
                     });
                 }
             }
+        }
+
+        if (plannedCustomFields) {
+            await this.customFieldsService.valuesService.applyWrite(model.id, plannedCustomFields);
         }
 
         return this.read({id: model.id}, options);
@@ -640,6 +706,12 @@ module.exports = class MemberBREADService {
 
         const bulkSuppressionData = await this.emailSuppressionList.getBulkSuppressionData(page.data.map(member => member.get('email')));
 
+        // One query for the whole page, not one per member. `null` when the flag
+        // is off or the caller didn't ask — the same truthiness guard read uses.
+        const customFieldsByMember = options.includeCustomFields
+            ? await this.fetchCustomFieldValues(page.data.map(model => model.id))
+            : null;
+
         const data = page.data.map((model, index) => {
             const member = model.toJSON(options);
             member.subscriptions = member.subscriptions.filter(sub => !!sub.price);
@@ -648,6 +720,9 @@ module.exports = class MemberBREADService {
             this.attachNextPaymentToSubscriptions(member);
             if (!originalWithRelated.includes('products')) {
                 delete member.products;
+            }
+            if (customFieldsByMember) {
+                member.custom_fields = customFieldsByMember.get(model.id) ?? {};
             }
             member.email_suppression = {
                 suppressed: bulkSuppressionData[index].suppressed || !!model.get('email_disabled'),
