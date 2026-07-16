@@ -23,6 +23,16 @@ describe('Member Custom Fields Admin API', function () {
         return body.members_custom_fields[0];
     }
 
+    // Archiving is a status change over the same PUT the rename uses (no dedicated
+    // /archive route), matching how newsletters move between active and archived.
+    async function setStatus(key: string, status: 'active' | 'archived') {
+        const {body} = await agent
+            .put(`members/custom_fields/${key}/`)
+            .body({members_custom_fields: [{status}]})
+            .expectStatus(200);
+        return body.members_custom_fields[0];
+    }
+
     let memberCounter = 0;
     async function createMember(): Promise<string> {
         memberCounter += 1;
@@ -75,6 +85,9 @@ describe('Member Custom Fields Admin API', function () {
             assert.equal(created.key, 'favourite-topic');
             assert.equal(created.name, 'Favourite topic');
             assert.equal(created.type, 'short_text');
+            // A new field is active; status travels with the definition so the UI
+            // can group active and archived fields from one list.
+            assert.equal(created.status, 'active');
             // id is the DB primary key and must never be exposed over the API.
             assert.equal(created.id, undefined);
 
@@ -172,16 +185,50 @@ describe('Member Custom Fields Admin API', function () {
             await agent.delete(`members/custom_fields/${missing}/`).expectStatus(404);
         });
 
+        it('hides archived fields from the default list', async function () {
+            const active = await createField({name: 'Favourite topic'});
+            const archived = await createField({name: 'Company'});
+            await setStatus(archived.key, 'archived');
+
+            const list = (await agent.get('members/custom_fields/').expectStatus(200)).body.members_custom_fields;
+            assert.equal(list.length, 1);
+            assert.equal(list[0].key, active.key);
+            assert.equal(list[0].status, 'active');
+        });
+
+        it('includes archived fields when the caller filters by status', async function () {
+            const active = await createField({name: 'Favourite topic'});
+            const archived = await createField({name: 'Company'});
+            await setStatus(archived.key, 'archived');
+
+            // Settings pulls active and archived in one request by overriding the
+            // active-only default with an explicit status filter.
+            const both = (await agent.get('members/custom_fields/?filter=status:[active,archived]').expectStatus(200))
+                .body.members_custom_fields;
+            const byKey = Object.fromEntries(both.map((f: {key: string}) => [f.key, f]));
+            assert.equal(both.length, 2);
+            assert.equal(byKey[active.key].status, 'active');
+            assert.equal(byKey[archived.key].status, 'archived');
+
+            // And archived-only for a dedicated view.
+            const onlyArchived = (await agent.get('members/custom_fields/?filter=status:archived').expectStatus(200))
+                .body.members_custom_fields;
+            assert.equal(onlyArchived.length, 1);
+            assert.equal(onlyArchived[0].key, archived.key);
+        });
+
         it('archives a field, keeping its name and slug reserved', async function () {
             const first = await createField({name: 'Favourite topic'});
 
-            await agent.delete(`members/custom_fields/${first.key}/`).expectStatus(204);
+            const archived = await setStatus(first.key, 'archived');
+            assert.equal(archived.status, 'archived');
 
-            // Archived: dropped from the active list...
-            const list = (await agent.get('members/custom_fields/').expectStatus(200)).body;
-            assert.deepEqual(list.members_custom_fields, []);
+            // Archived: gone from the default list...
+            const list = (await agent.get('members/custom_fields/').expectStatus(200)).body.members_custom_fields;
+            assert.deepEqual(list, []);
 
-            // ...its name stays reserved (uniqueness spans archived fields too)...
+            // ...but still there, so its name stays reserved (uniqueness spans
+            // archived fields too)...
             await agent
                 .post('members/custom_fields/')
                 .body({members_custom_fields: [{name: 'Favourite topic', type: 'short_text'}]})
@@ -193,9 +240,20 @@ describe('Member Custom Fields Admin API', function () {
             assert.equal(second.key, 'favourite-topic-2');
         });
 
+        it('restores an archived field', async function () {
+            const field = await createField({name: 'Favourite topic'});
+            await setStatus(field.key, 'archived');
+
+            const restored = await setStatus(field.key, 'active');
+            assert.equal(restored.status, 'active');
+
+            const read = (await agent.get(`members/custom_fields/${field.key}/`).expectStatus(200)).body;
+            assert.equal(read.members_custom_fields[0].status, 'active');
+        });
+
         it('frees a name for reuse once the archived field is renamed', async function () {
             const original = await createField({name: 'Company'});
-            await agent.delete(`members/custom_fields/${original.key}/`).expectStatus(204);
+            await setStatus(original.key, 'archived');
 
             // The archived field still owns "Company", so rename it to release it...
             await agent
@@ -207,6 +265,34 @@ describe('Member Custom Fields Admin API', function () {
             const fresh = await createField({name: 'Company'});
             assert.equal(fresh.name, 'Company');
             assert.notEqual(fresh.key, original.key);
+        });
+
+        it('refuses to permanently delete an active field', async function () {
+            // Deleting is gated on the archived state: a publisher must archive
+            // first, so permanent data loss is always a deliberate two-step.
+            const field = await createField({name: 'Favourite topic'});
+
+            await agent.delete(`members/custom_fields/${field.key}/`).expectStatus(422);
+
+            const list = (await agent.get('members/custom_fields/').expectStatus(200)).body.members_custom_fields;
+            assert.equal(list.length, 1);
+        });
+
+        it('permanently deletes an archived field, freeing its name and slug', async function () {
+            const original = await createField({name: 'Favourite topic'});
+            await setStatus(original.key, 'archived');
+
+            await agent.delete(`members/custom_fields/${original.key}/`).expectStatus(204);
+
+            // Gone entirely — not in the list, and no longer readable.
+            const list = (await agent.get('members/custom_fields/').expectStatus(200)).body.members_custom_fields;
+            assert.deepEqual(list, []);
+            await agent.get(`members/custom_fields/${original.key}/`).expectStatus(404);
+
+            // The row is gone, so the name and its base slug are free again: a
+            // fresh field with the same name reclaims the original (unsuffixed) key.
+            const fresh = await createField({name: 'Favourite topic'});
+            assert.equal(fresh.key, 'favourite-topic');
         });
     });
 
@@ -406,7 +492,7 @@ describe('Member Custom Fields Admin API', function () {
         it('rejects a value for an archived field', async function () {
             const field = await createField({name: 'Favourite topic'});
             const memberId = await createMember();
-            await agent.delete(`members/custom_fields/${field.key}/`).expectStatus(204);
+            await setStatus(field.key, 'archived');
 
             await setValues(memberId, {[field.key]: 'Ghosts'}, 422);
         });
@@ -416,13 +502,27 @@ describe('Member Custom Fields Admin API', function () {
             const memberId = await createMember();
             await setValues(memberId, {[field.key]: 'Ghosts'});
 
-            await agent.delete(`members/custom_fields/${field.key}/`).expectStatus(204);
+            await setStatus(field.key, 'archived');
 
             assert.deepEqual(await readValues(memberId), {});
-            // The row survives archiving — the definition is what went away, and
-            // the value is still attached to it.
+            // The row survives archiving — only the definition was hidden, and the
+            // value is still attached to it (restoring the field brings it back).
             const rows = await models.Base.knex('members_custom_field_values').where('member_id', memberId);
             assert.equal(rows.length, 1);
+        });
+
+        it('drops a field\'s values when the field is permanently deleted', async function () {
+            const field = await createField({name: 'Favourite topic'});
+            const memberId = await createMember();
+            await setValues(memberId, {[field.key]: 'Ghosts'});
+
+            // Archive then delete — the FK cascade removes the member's value with
+            // the definition, so a permanent delete takes the data with it.
+            await setStatus(field.key, 'archived');
+            await agent.delete(`members/custom_fields/${field.key}/`).expectStatus(204);
+
+            const rows = await models.Base.knex('members_custom_field_values').where('member_id', memberId);
+            assert.equal(rows.length, 0);
         });
 
         it('rejects a value that is the wrong type for the field', async function () {
@@ -637,12 +737,44 @@ describe('Member Custom Fields Admin API', function () {
 
         it('records an "archived" action when a field is archived', async function () {
             const field = await createField({name: 'Favourite topic'});
-            await agent.delete(`members/custom_fields/${field.key}/`).expectStatus(204);
+            await setStatus(field.key, 'archived');
 
             const archived = (await customFieldActions()).find((a: {event: string}) => a.event === 'archived');
             assert.ok(archived, 'an archived action should be recorded');
             assert.equal(archived.resource_id, field.key);
             assert.equal(archived.actor_id, actorId);
+        });
+
+        it('records a "restored" action when an archived field is restored', async function () {
+            const field = await createField({name: 'Favourite topic'});
+            await setStatus(field.key, 'archived');
+            await setStatus(field.key, 'active');
+
+            const restored = (await customFieldActions()).find((a: {event: string}) => a.event === 'restored');
+            assert.ok(restored, 'a restored action should be recorded');
+            assert.equal(restored.resource_id, field.key);
+            assert.equal(restored.actor_id, actorId);
+        });
+
+        it('records no action when the status does not change', async function () {
+            const field = await createField({name: 'Favourite topic'});
+            await setStatus(field.key, 'active');
+
+            const archived = (await customFieldActions()).find((a: {event: string}) => a.event === 'archived');
+            const restored = (await customFieldActions()).find((a: {event: string}) => a.event === 'restored');
+            assert.equal(archived, undefined, 'a no-op status change should not record an action');
+            assert.equal(restored, undefined, 'a no-op status change should not record an action');
+        });
+
+        it('records a "deleted" action when an archived field is permanently deleted', async function () {
+            const field = await createField({name: 'Favourite topic'});
+            await setStatus(field.key, 'archived');
+            await agent.delete(`members/custom_fields/${field.key}/`).expectStatus(204);
+
+            const deleted = (await customFieldActions()).find((a: {event: string}) => a.event === 'deleted');
+            assert.ok(deleted, 'a deleted action should be recorded');
+            assert.equal(deleted.resource_id, field.key);
+            assert.equal(deleted.actor_id, actorId);
         });
     });
 

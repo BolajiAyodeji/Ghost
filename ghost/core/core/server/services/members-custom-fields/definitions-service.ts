@@ -5,12 +5,19 @@ import {z} from 'zod';
 import {CustomField} from './models';
 import {FieldTypeSchema} from '@tryghost/custom-field-types';
 import {customFieldCodec} from './codec';
-import {FIELD_STATUS} from './schema';
+import {FIELD_STATUS, FieldStatusSchema} from './schema';
 import {activeFields} from './queries';
 import {type RecordCustomFieldAction, type RequestContext} from './actions';
 
 // @tryghost/string ships no types; slugify is the same helper tags/labels use.
 const {slugify} = require('@tryghost/string') as {slugify(input: string): string};
+
+// The same NQL -> knex bridge Bookshelf's filter plugin uses, applied directly to
+// our raw-knex query: nql parses the `filter` string to a Mongo query, mongo-knex
+// turns that into parametrised WHERE clauses. Neither needs a Bookshelf model.
+const nql = require('@tryghost/nql') as (filter: string) => {toJSON(): object};
+const knexify = require('@tryghost/mongo-knex') as
+    <T extends Knex.QueryBuilder>(qb: T, mongoQuery: object, config: {tableName: string}) => T;
 
 const TABLE = 'members_custom_fields';
 
@@ -33,10 +40,11 @@ const AddFieldInput = z.object({
     type: FieldTypeSchema
 });
 
-// Only the name is mutable. `key` and `type` are accepted so the immutability
+// Name and status are mutable. `key` and `type` are accepted so the immutability
 // rules can reject a change loudly; they are never persisted.
 const EditFieldInput = z.object({
     name: FieldName.optional(),
+    status: FieldStatusSchema.optional(),
     key: z.string().optional(),
     type: FieldTypeSchema.optional()
 });
@@ -50,11 +58,23 @@ export class CustomFieldDefinitionsService {
         this.recordAction = recordAction;
     }
 
-    async browse(): Promise<CustomField[]> {
-        // Active fields only; archived fields are retained (so their key stays
-        // reserved) but hidden. Insertion order for now — when the UI needs a
-        // persistent user-defined order, add a `sort_order` column and order by it.
-        const rows = await activeFields(this.knex)
+    async browse(options: {filter?: string} = {}): Promise<CustomField[]> {
+        // Archived fields are hidden by default: most surfaces (member details, the
+        // filter picker, the importer) only ever want active fields. A caller-
+        // supplied `filter` overrides that default, which is how Settings pulls
+        // active and archived together in one request (`filter=status:[active,archived]`).
+        //
+        // status is the only dimension the definition list is filtered on today, so
+        // a filter replaces the active default outright. If other filters are added,
+        // switch to a per-field merge (Bookshelf's defaultFilters behaviour) so the
+        // active default still applies to filters that don't mention status.
+        //
+        // Insertion order for now — when the UI needs a persistent user-defined
+        // order, add a `sort_order` column and order by it.
+        const query = options.filter
+            ? knexify(this.knex(TABLE), nql(options.filter).toJSON(), {tableName: TABLE})
+            : activeFields(this.knex);
+        const rows = await query
             .orderBy('created_at', 'asc')
             .orderBy('id', 'asc')
             .select('*');
@@ -180,13 +200,25 @@ export class CustomFieldDefinitionsService {
             await this.recordAction({context, verb: 'rename', subject: key});
         }
 
+        // A status change is the archive/restore transition. Only write (and log)
+        // when it actually flips, so re-sending the current status is a no-op.
+        if (patch.status !== undefined && patch.status !== existing.status) {
+            await this.knex(TABLE)
+                .where('key', key)
+                .update({status: patch.status, updated_at: new Date()});
+            const verb = patch.status === FIELD_STATUS.archived ? 'archive' : 'restore';
+            await this.recordAction({context, verb, subject: key});
+        }
+
         return this.read(key);
     }
 
     /**
-     * Archive a field (soft delete): it drops out of `browse`, but its row and key
-     * are kept forever, so the slug can never be reused and any values stay
-     * attached to the right definition. Idempotent — re-archiving is a no-op.
+     * Permanently delete a field and every member value attached to it (the FK
+     * cascades the values). Destructive and irreversible, so it's gated on the
+     * field already being archived: a publisher must archive first, then delete,
+     * which makes accidental data loss a deliberate two-step. Archiving is the
+     * reversible soft state (see `edit` with a status change).
      */
     async destroy(context: RequestContext, key: string): Promise<void> {
         const field = await this.knex(TABLE).where('key', key).first();
@@ -194,9 +226,10 @@ export class CustomFieldDefinitionsService {
             throw new errors.NotFoundError({message: 'Custom field not found.'});
         }
         if (field.status !== FIELD_STATUS.archived) {
-            await this.knex(TABLE).where('key', key).update({status: FIELD_STATUS.archived, updated_at: new Date()});
-            await this.recordAction({context, verb: 'archive', subject: key});
+            throw new errors.ValidationError({message: 'Only archived custom fields can be deleted. Archive the field first.'});
         }
+        await this.knex(TABLE).where('key', key).del();
+        await this.recordAction({context, verb: 'delete', subject: key});
     }
 }
 

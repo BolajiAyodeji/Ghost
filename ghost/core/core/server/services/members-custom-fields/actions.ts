@@ -13,13 +13,16 @@ export interface ActionRecorder {
     add(data: Record<string, unknown>, options: {autoRefresh: boolean}): Promise<unknown>;
 }
 
-// Field-definition changes map to activity-feed events. Fields are archived, not
-// deleted, so the timeline reads added -> edited -> archived.
+// Field-definition changes map to activity-feed events. A field's timeline reads
+// added -> edited -> archived -> restored, and a permanent delete (only from the
+// archived state) ends it with deleted.
 const COMMANDS = {
     create: 'added',
     rename: 'edited',
-    archive: 'archived'
-} as const satisfies Record<string, 'added' | 'edited' | 'archived'>;
+    archive: 'archived',
+    restore: 'restored',
+    delete: 'deleted'
+} as const satisfies Record<string, 'added' | 'edited' | 'archived' | 'restored' | 'deleted'>;
 
 export type CustomFieldVerb = keyof typeof COMMANDS;
 
